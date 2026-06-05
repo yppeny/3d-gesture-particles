@@ -64,7 +64,7 @@
 </head>
 <body>
 
-    <video id="inputVideo" autoplay playsinline style="position:fixed;top:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;"></video>
+    <video id="inputVideo" autoplay playsinline style="position:fixed;bottom:10px;right:10px;width:200px;height:150px;transform:scaleX(-1);border:2px solid #555;border-radius:8px;z-index:10;opacity:1;"></video>
 
     <!-- 加载遮罩（点击可跳过） -->
     <div id="loading">
@@ -83,8 +83,9 @@
     <!-- HUD -->
     <div id="info">
         <h2>3D Particle · Gesture</h2>
-        <div class="hint">手势 1 = hello ｜ 2 = 哎呀不错哦 ｜ 3 = 我爱你们</div>
+        <div class="hint">手势 1 = hello ｜ 2 = 哎呀不错哦 ｜ 3 = 我爱你们 ｜ 键盘 1/2/3/0 可切换</div>
         <div class="status" id="gestureText">正在初始化…</div>
+        <div class="status" id="debugText" style="color:#ff6b35;font-size:11px;"></div>
     </div>
 
     <div id="demo-hint"></div>
@@ -116,10 +117,10 @@
         scatterRadius: 3.2,
 
         // 动画物理
-        lerpSpeed: 3.5,
-        noiseBaseAmp: 0.018,
-        noiseTransitionExtra: 0.025,
-        noiseDecayRate: 4.5,
+        lerpSpeed: 4.0,
+        noiseBaseAmp: 0.006,
+        noiseTransitionExtra: 0.020,
+        noiseDecayRate: 5.0,
 
         // 手指引力
         gravityRadius: 0.9,
@@ -127,7 +128,7 @@
         gravityMaxForce: 60,
 
         // 手势防抖
-        gestureStableFrames: 4,
+        gestureStableFrames: 12, // 约 1 秒才能切换手势（12帧 × 80ms）
         spreadScaleMin: 0.35,
         spreadScaleMax: 2.0,
 
@@ -173,6 +174,7 @@
         loadingEl: null,
         errorEl: null,
         gestureTextEl: null,
+        debugTextEl: null,
         demoHintEl: null,
         videoEl: null,
         loadTimer: null,
@@ -497,13 +499,13 @@
             distances[i] = maxDist;
         }
 
-        // 3. 平滑
+        // 3. 更大平滑窗口
         const smoothed = new Float32Array(NUM_RAYS);
         for (let i = 0; i < NUM_RAYS; i++) {
             let sum = 0;
-            const window2 = 3;
+            const ws = 5; // 窗口半径 5
             let count = 0;
-            for (let j = -window2; j <= window2; j++) {
+            for (let j = -ws; j <= ws; j++) {
                 const idx = (i + j + NUM_RAYS) % NUM_RAYS;
                 sum += distances[idx];
                 count++;
@@ -511,25 +513,32 @@
             smoothed[i] = sum / count;
         }
 
-        // 4. 找峰（指尖）
+        // 4. 更严格的找峰条件
         const meanDist = smoothed.reduce((a, b) => a + b, 0) / NUM_RAYS;
         const maxDist = Math.max(...smoothed);
-        const threshold = meanDist * 1.25; // 峰必须明显高于均值
+        const absThreshold = Math.max(meanDist * 1.6, maxDist * 0.45); // 双条件：高于均值60% 且 达到最高峰45%
 
         const peaks = [];
         for (let i = 0; i < NUM_RAYS; i++) {
-            const prev = smoothed[(i - 1 + NUM_RAYS) % NUM_RAYS];
+            // 检查左右各4个邻居，确保是真正的局部最大值
+            let isPeak = true;
             const curr = smoothed[i];
-            const next = smoothed[(i + 1) % NUM_RAYS];
-            if (curr > prev && curr > next && curr > threshold) {
-                // 合并相邻峰
-                if (peaks.length === 0 || i - peaks[peaks.length - 1] > 12) {
+            if (curr < absThreshold) continue;
+            for (let j = -4; j <= 4; j++) {
+                if (j === 0) continue;
+                const idx = (i + j + NUM_RAYS) % NUM_RAYS;
+                if (smoothed[idx] >= curr) { isPeak = false; break; }
+            }
+            if (isPeak) {
+                // 合并相邻峰（至少间隔 18 个角度方向）
+                if (peaks.length === 0 || i - peaks[peaks.length - 1] > 18) {
                     peaks.push(i);
                 }
             }
         }
 
-        const fingerCount = peaks.length;
+        // 最多取前 3 个最高的峰
+        const fingerCount = Math.min(peaks.length, 3);
 
         // 5. 计算张合度：maxDist / meanDist
         const spread01 = THREE.MathUtils.clamp((maxDist / Math.max(meanDist, 1) - 1.2) / 1.5, 0, 1);
@@ -745,6 +754,7 @@
         APP.loadingEl = document.getElementById('loading');
         APP.errorEl = document.getElementById('error');
         APP.gestureTextEl = document.getElementById('gestureText');
+        APP.debugTextEl = document.getElementById('debugText');
         APP.demoHintEl = document.getElementById('demo-hint');
 
         // Demo 按钮
@@ -790,9 +800,12 @@
             });
         }
 
-        // Canvas 肤色检测帧循环（每 80ms 检测一次，节省性能）
+        // Canvas 肤色检测帧循环（每 80ms 检测一次）
         let firstDetected = false;
         let detectTimer = 0;
+        let handLostFrames = 0;        // 手丢失帧计数（hysteresis）
+        const HAND_LOST_THRESHOLD = 8; // 连续 8 帧无手才认为真正丢失
+
         function startDetectionLoop() {
             requestAnimationFrame(startDetectionLoop);
 
@@ -804,12 +817,21 @@
 
             const result = detectFromVideo();
             if (result) {
-                APP.hasHand = true;
+                handLostFrames = 0;
+
+                // 实时显示检测数据
+                if (APP.debugTextEl) {
+                    APP.debugTextEl.textContent =
+                        '检测: ' + result.gesture + '指 | 张合:' + result.spread.toFixed(2) +
+                        ' | 手X:' + result.fingerPos.x.toFixed(1) + ' Y:' + result.fingerPos.y.toFixed(1);
+                }
 
                 if (!firstDetected) {
                     firstDetected = true;
+                    APP.hasHand = true;
                     onFirstDetection();
                 }
+                APP.hasHand = true;
 
                 // 手势防抖
                 const raw = result.gesture;
@@ -830,8 +852,25 @@
                 APP.targetSpreadScale = result.spread;
                 APP.fingerPos3D.copy(result.fingerPos);
             } else {
-                APP.hasHand = false;
-                APP.targetSpreadScale = 1.0;
+                handLostFrames++;
+                if (APP.debugTextEl && handLostFrames <= 3) {
+                    APP.debugTextEl.textContent = '未检测到手 (帧:' + handLostFrames + ')';
+                }
+                if (handLostFrames >= HAND_LOST_THRESHOLD) {
+                    APP.hasHand = false;
+                    APP.targetSpreadScale = 1.0;
+                    if (APP.debugTextEl) APP.debugTextEl.textContent = '无手势 — 键盘 1/2/3 可切换';
+                    // 手丢失后回到散布状态
+                    if (APP.detectedGesture !== 0 && !APP.isDemoMode) {
+                        APP.rawGesture = 0;
+                        APP.stableCounter = 0;
+                        APP.prevGesture = APP.detectedGesture;
+                        APP.detectedGesture = 0;
+                        APP.transitionTimer = 0;
+                        APP.transitionNoiseExtra = CONFIG.noiseTransitionExtra;
+                        updateGestureUI();
+                    }
+                }
             }
         }
 
